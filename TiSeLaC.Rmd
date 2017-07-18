@@ -1,0 +1,411 @@
+---
+title: TiSeLaC - Landsat Time Series Land Cover Classification Challenge
+author:
+  - name: Victor Maus
+    email: vwmaus1@gmail.com 
+    affiliation: INPE,IIASA
+    footnote: Corresponding Author
+  - name: Gilberto Câmara 
+    email: gilberto.camara@inpe.br
+    affiliation: INPE
+  - name: Rolf Simoes 
+    email: rolfsimoes@gmail.com
+    affiliation: INPE
+  - name: Luiz Fernando Assis 
+    email: luizffga@dpi.inpe.br
+    affiliation: INPE
+  - name: Adeline Marinho  
+    email: adeline.maciel@inpe.br
+    affiliation: INPE
+  - name: Pedro Andrade  
+    email: pedro.andrade@inpe.br
+    affiliation: INPE
+  - name: Gilberto Ribeiro 
+    email: gribeiro@dpi.inpe.br
+    affiliation: INPE
+  - name: Karine Reis Ferreira 
+    email: karine.ferreira@inpe.br
+    affiliation: INPE
+  - name: Lubia Vinhas 
+    email: lubia.vinhas@inpe.br
+    affiliation: INPE
+address:
+  - code: INPE
+    address: National Institute for Space Research, Image Processing Division, Av. dos Astronautas 1758, São José dos Campos, SP, 12227-010
+  - code: IIASA
+    address: International Institute for Applied Systems Analysis, Ecosystems Services and Management Program, Schlossplatz 1, Laxenburg, Lower Austria, A-2361
+abstract: |
+  This is the abstract.
+
+  It consists of two paragraphs.
+
+bibliography: mybibfile.bib
+output: rticles::elsevier_article
+---
+
+```{r set-chunk-options, echo = FALSE, eval = TRUE, cache = FALSE}
+library(knitr)
+opts_chunk$set(
+  warning    = FALSE,
+  message    = FALSE,
+  error      = FALSE,
+  results    = "hide",
+  cache.path = "./cache/",
+  fig.path   = "./Figures/",
+  cache      = FALSE
+)
+knit_hooks$set(purl = hook_purl) # Save chunks to Rscript file
+```
+
+# Time series analysis
+
+### Load required R packages
+
+Before installing the packages make sure to have installed `GDAL`, `Python`, and Python package `python3-scikit-learn`.
+
+```{r install-dependencies, warning = FALSE, message = FALSE, eval = TRUE, echo = TRUE, results = 'hide'}
+install.packages(c("devtools",
+                   "dtwSat",
+                   "dtwclust",
+                   "tidyverse",
+                   "parallel",
+                   "doParallel",
+                   "rPython",
+                   "rfUtilities",
+                   "progress"))
+
+# Install packages from github 
+devtools::install_github("hadley/multidplyr", ref = "0085ded")
+devtools::install_github("gilbertocamara/sits", ref = "bc04b19")
+```
+### Load required R packages
+```{r load-required-r-packages, warning = FALSE, message = FALSE, eval = TRUE, echo = TRUE, results = 'hide'}
+library(dtwSat)
+library(sits)
+library(dtwclust)
+library(tidyverse)
+library(lubridate)
+library(purrrlyr)
+library(multidplyr)
+library(parallel)
+library(doParallel)
+library(rPython)
+library(rfUtilities)
+library(progress)
+source("functions.R")
+```
+
+### Read training dataset 
+<!-- 
+Reference land cover data has been built using two publicly available dataset, namely the 2012 Corine Land Cover (CLC) map and the 2014 farmers' graphical land parcel registration (Régistre Parcellaire Graphique - RPG). The most significant classes for the study area have been retained, and a spatial processing (aided by photo-interpretation) has also been performed to ensure consistency with image geometry. Finally, a pixel-based random sampling of this dataset has been applied to provide an almost balanced ground truth. The final reference training dataset consists of a total of 82230 pixels distributed over 9 classes. More in detail, the training dataset contains 82230 rows (one for each pixel) and 230 columns (10 features x 23 dates). The columns are temporally ordered, this means that features from 1 to 10 correspond to the first timestamps, features from 11 to 20 correspond to the second timestamps, ..., features from 220 to 230 correspond to the last timestamps. The feature order, for each timestamps, is the same:  7 surface reflectances (Ultra Blue, Blue, Green, Red, NIR, SWIR1 and SWIR2) plus 3 indices (NDVI, NDWI and BI). 
+
+A second file contains the Land Cover Classes for the training set. The class file contains as many rows as the training data file where the value in a row is the class of the corresponding pixel (at the same row) in the dataset file. 
+-->
+
+```{r set-dataset-information, eval = TRUE, echo = TRUE, results = 'markup'}
+coverage <- "Landsat"
+
+bands <- c("Ultra Blue", 
+           "Blue", 
+           "Green", 
+           "Red", 
+           "NIR", 
+           "SWIR1", 
+           "SWIR2", 
+           "NDVI", 
+           "NDWI", 
+           "BI")
+
+samples_label <- tibble::tribble(
+  ~label_id,                    ~label, ~instances,
+          1,             "Urban Areas", 16000,
+          2, "Other built-up surfaces",  3236,
+          3,                 "Forests", 16000,
+          4,       "Sparse Vegetation", 16000,
+          5,     "Rocks and bare soil", 12942,
+          6,               "Grassland",  5681,
+          7,         "Sugarcane crops",  7656,
+          8,             "Other crops",  1600,
+          9,                   "Water",  2599
+  ) %>% 
+  mutate(label = factor(label))
+
+start_date <- lubridate::ymd("2014-01-01")
+
+end_date <- lubridate::ymd("2014-12-31")
+
+ts_length <- 23
+
+scale_factor <- 0.001
+
+timestamps <- 
+  seq(start_date, end_date, length.out = ts_length)
+
+col_names <- 
+  paste(rep(bands, length(timestamps)), 
+        rep(seq_along(timestamps), each = length(bands)), sep = "_")
+
+```
+
+```{r tidy-training-timeseries-parallel, eval = FALSE, echo = FALSE, results = 'markup'}
+if(!file.exists("./training_dataset/training_ts.csv")){
+  
+  ## Download data and safe to "./training_dataset"
+  # Time_series: https://drive.google.com/open?id=0B383FlgU32evbm5Fa2JZcHRpVzg
+  # Grid_coordinates: https://drive.google.com/open?id=0B383FlgU32evbmI4bkE0THd4UHM
+  # Class_labels: https://drive.google.com/open?id=0B383FlgU32evTUdpWHBNZDlHR1E
+   
+  training_data <- bind_cols(
+    readr::read_csv("./training_dataset/coord_training.txt",
+                    col_names = c("x", "y"), 
+                    col_types = cols(
+                      x = col_integer(),
+                      y = col_integer()
+                      )),
+    readr::read_csv("./training_dataset/training_class.txt",
+                    col_names = c("label_id"), 
+                    col_types = cols(class_id = col_double())) %>% left_join(samples_label),
+    readr::read_csv("./training_dataset/training.txt", 
+                    col_names = col_names,
+                    col_types = cols(.default = col_integer()))
+  )
+  
+  # Step 0: Get Number of Cores (Optional)
+  cl <- detectCores()
+  
+  # Step 1: Add Groups
+  p_group <- rep(1:cl, length.out = nrow(training_data))
+  
+  # Step 2: Create Clusters 
+  cluster <- multidplyr::create_cluster(cores = cl)
+  
+  # Step 3: Partition by Group 
+  by_group <- training_data %>% 
+    dplyr::bind_cols(tibble::tibble(p_group), .) %>% 
+    multidplyr::partition(p_group, cluster = cluster)
+  
+  # Step 4: Setup Clusters dependencies 
+  by_group %>%
+    cluster_library("tidyverse") %>%
+    cluster_library("purrrlyr") %>%
+    cluster_assign_value("tidy_ts", tidy_ts) %>% 
+    cluster_assign_value("bands", bands) %>%
+    cluster_assign_value("timestamps", timestamps) %>% 
+    cluster_assign_value("coverage", coverage) %>% 
+    cluster_assign_value("scale_factor", scale_factor) 
+  
+  # Step 5: Run Parallelized Code (4 cores ~ 30 min)
+  start <- proc.time()
+  training_ts <- by_group %>% 
+    do(tidy_ts(., bands = bands, timestamps = timestamps, 
+               coverage = coverage, scale_factor = scale_factor)) %>% 
+    dplyr::collect() %>% 
+    dplyr::ungroup() %>% 
+    dplyr::select(-p_group)
+  time_elapsed_parallel <- proc.time() - start 
+  time_elapsed_parallel
+  
+  # Write to files 
+  training_ts %>% 
+    tidyr::unnest() %>% 
+    write_csv(path = "./training_dataset/training_ts.csv")
+  
+  write_rds(training_ts, path = "./training_dataset/training_ts.rds")
+  
+} else {
+  training_ts <- read_rds("./training_dataset/training_ts.rds")
+}
+```
+
+
+```{r perform-simple-twddtw-analysis, eval = FALSE, echo = FALSE, results = 'markup'}
+set.seed(1)
+
+# Select 5% of samples for training 
+s05 <- training_ts %>% 
+  group_by(label_id) %>% 
+  sample_frac(size = .05) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::select(-label_id)
+
+# Select 10% of the samples for validation 
+s10 <- training_ts %>% 
+  group_by(label_id) %>% 
+  sample_frac(size = .10) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::select(-label_id)
+
+# Create temporal patterns 
+patt <- s05 %>% 
+  tibble_to_twdtwTimeSeries() %>% 
+  createPatterns(from = start_date, 
+                 to = end_date, 
+                 freq = 8, 
+                 formula = y~s(x))
+
+plotPatterns(patt)
+
+# Set weight function 
+log_fun <- logisticWeight(-0.1, 50)
+
+chunk_size <- tibble::tribble(
+  ~start,     ~end,
+       1,      nrow(s10)
+  )
+
+rep_chunk <- 1
+
+twdtw_class <- twdtw_parallel(x = s10, y = patt, weight.fun = log_fun, n = 1, theta = 0.5, 
+                              from = start_date, to = end_date, by = end_date - start_date, overlap = 0.01, 
+                              chunk_size = chunk_size, rep_chunk = rep_chunk)
+
+classification_twdtw <- get_labels_cluster_classification(twdtw_class, samples_label)
+
+# Accuracy metrics 
+rfUtilities::accuracy(x = classification_twdtw$twdtw_label, 
+                      y = classification_twdtw$label)
+
+# f1 score using python (f1 ~ 0.6147294)
+get_py_F1(true = classification_twdtw$label_id_true,
+          pred = classification_twdtw$label_id_pred)
+```
+
+
+
+
+
+```{r twdtw-clustering, eval = FALSE, echo = FALSE, results = 'markup'}
+# Get cluster and safe to rds files 
+proc_time <- get_clusters(x = training_ts, nsamples = 500, path = "./training_dataset", k = 5, seed = 42)
+ts <- read_clusters_to_twdtw(path = "./training_dataset", pattern = "cluster_500_DTW_", k = 2)
+
+cl_patt  <- ts %>% 
+  createPatterns(from = start_date, 
+                 to = end_date, 
+                 freq = 8, 
+                 formula = y~s(x))
+
+plotPatterns(cl_patt)
+
+chunk_size <- tibble::tribble(
+  ~start,     ~end,
+       1,      nrow(s10)
+)
+
+rep_chunk <- 1
+
+log_fun <- logisticWeight(-0.1, 50)
+twdtw_clust_class <- twdtw_parallel(x = s10, y = cl_patt, weight.fun = log_fun, n = 1, theta = 0.5, 
+                                    from = start_date, to = end_date, by = end_date - start_date, overlap = 0.01, 
+                                    chunk_size = chunk_size, rep_chunk = rep_chunk)
+
+classification_twdtw_clust <- get_labels_cluster_classification(twdtw_clust_class, samples_label)
+
+# Accuracy metrics 
+rfUtilities::accuracy(x = classification_twdtw_clust$twdtw_label, 
+                      y = classification_twdtw_clust$label)
+
+# f1 score using python (~0.6181172)
+get_py_F1(true = classification_twdtw_clust$label_id_true,
+          pred = classification_twdtw_clust$label_id_pred)
+
+```
+
+```{r filter-simple-twdtw-analysis, eval = FALSE, echo = FALSE, results = 'markup'}
+# Filter time series with constant values for more than a month and 
+# time series that have spurious oscillations
+selected <- training_ts %>% 
+  rowwise() %>% 
+  do(tag = filter_ts(.$time_series, width = 3, max_diff = 0.4)) %>%
+  summarise(tag = unlist(tag))
+
+patt_filter <- training_ts %>% 
+  slice(which(selected$tag)) %>% 
+  tibble_to_twdtwTimeSeries() %>%
+  createPatterns(x = ,
+                 from = start_date, 
+                 to = end_date, 
+                 freq = 8, 
+                 formula = y~s(x))
+
+plotPatterns(patt_filter) 
+
+# Set weight function 
+log_fun <- logisticWeight(-0.1, 50)
+
+chunk_size <- tibble::tribble(
+  ~start,     ~end,
+       1,      nrow(s10)
+  )
+
+rep_chunk <- 1
+
+twdtw_filter_class <- twdtw_parallel(x = s10, y = patt_filter, weight.fun = log_fun, n = 1, theta = 0.5, 
+                              from = start_date, to = end_date, by = end_date - start_date, overlap = 0.01, 
+                              chunk_size = chunk_size, rep_chunk = rep_chunk)
+
+classification_twdtw_filter <- get_labels_cluster_classification(twdtw_filter_class, samples_label)
+
+# Accuracy metrics 
+rfUtilities::accuracy(x = classification_twdtw_filter$twdtw_label, 
+                      y = classification_twdtw_filter$label)
+
+# f1 score using python (f1 ~ 0.6069784)
+get_py_F1(true = classification_twdtw_filter$label_id_true,
+          pred = classification_twdtw_filter$label_id_pred)
+```
+
+
+```{r filter-and-twdtw-clustering, eval = FALSE, echo = FALSE, results = 'markup'}
+# Get cluster and safe to rds files 
+proc_time <- training_ts %>% 
+  slice(which(selected$tag)) %>% get_clusters(nsamples = 500, path = "./training_dataset/clust_filtered", k = 5, seed = 42)
+ts <- read_clusters_to_twdtw(path = "./training_dataset/clust_filtered", pattern = "cluster_500_DTW_", k = 2)
+
+cl_filtered_patt  <- ts %>% 
+  createPatterns(from = start_date, 
+                 to = end_date, 
+                 freq = 8, 
+                 formula = y~s(x))
+
+plotPatterns(cl_filtered_patt)
+
+chunk_size <- tibble::tribble(
+  ~start,     ~end,
+       1,      nrow(s10)
+)
+
+rep_chunk <- 1
+
+log_fun <- logisticWeight(-0.1, 50)
+cl_filtered_class <- twdtw_parallel(x = s10, y = cl_filtered_patt, weight.fun = log_fun, n = 1, theta = 0.5, 
+                                    from = start_date, to = end_date, by = end_date - start_date, overlap = 0.01, 
+                                    chunk_size = chunk_size, rep_chunk = rep_chunk)
+
+classification_cl_filtered <- get_labels_cluster_classification(cl_filtered_class, samples_label)
+
+# Accuracy metrics 
+rfUtilities::accuracy(x = classification_cl_filtered$twdtw_label, 
+                      y = classification_cl_filtered$label)
+
+# f1 score using python 
+get_py_F1(true = classification_cl_filtered$label_id_true,
+          pred = classification_cl_filtered$label_id_pred)
+
+```
+
+
+
+
+####  
+
+
+References {#references .unnumbered}
+==========
+
+
+
+
+
+
+

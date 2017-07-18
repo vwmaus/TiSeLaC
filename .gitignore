@@ -31,3 +31,18 @@ vignettes/*.pdf
 # Temporary files created by R markdown
 *.utf8.md
 *.knit.md
+
+# Other files 
+TODO.md
+TiSeLaC.R
+TiSeLaC.Rproj
+TiSeLaC.pdf
+TiSeLaC.tex
+classification_results/
+corinho.R
+corinho2.R
+skeleton.pdf
+skeleton.tex
+test-python.R
+training_dataset/*
+
